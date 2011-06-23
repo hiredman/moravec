@@ -1,5 +1,6 @@
 (ns moravec.four
   (:refer-clojure :exclude [eval])
+  (:use [match.core :only [defmn mn]])
   (:import (clojure.asm ClassWriter Opcodes Type)
            (clojure.asm.commons Method GeneratorAdapter)))
 
@@ -49,41 +50,21 @@
 (defmethod line-up-seq 'quote [[_ form]] (line-up-quote form))
 
 (defn line-up-fn-body [[args & body]]
-  [:create-method
-   :invoke (count args)
+  [[:invoke (count args)]
    (concat [[:push-method-frame args]]
-           (->> (mapcat line-up body)
-                (map (fn [[t v :as stmt]]
-                       (if (= t :name)
-                         (if ((set args) v)
-                           [:local v]
-                           [:name v])
-                         stmt))))
-           [[:pop-frame (set args)]
-            [:return]])])
+           (mapcat line-up body)
+           [[:pop-frame (set args)]])])
 
 (defmethod line-up-seq 'fn* [form]
   (let [[this-fn form] (if (symbol? (second form))
                          [(second form) (list* (first form) (rest (rest form)))]
                          [(gensym "fn__") form])
         n this-fn
-        b (map line-up-fn-body (rest form))
-        b (map
-           (fn [[w x y z]]
-             (->> z
-                  (map (fn [[t v :as e]]
-                         (if (= t :name)
-                           (if (= v this-fn)
-                             [:this-fn this-fn]
-                             [:free v])
-                           e)))
-                  list
-                  (into [w x y])))
-           b)]
-    [[:define-fn
-      :name n
-      :body b]
-     [:vivify-fun n]]))
+        b (into {} (map line-up-fn-body (rest form)))]
+    [(list
+      'fn
+      {:name n
+       :procs b})]))
 
 (defmethod line-up-seq 'do [[_ & forms]]
   (mapcat line-up forms))
@@ -803,3 +784,189 @@
                identity)]
     (clojure.pprint/pprint x)
     (.invoke (first (last (code-gen (conj x [:halt])))))))
+
+(defprotocol Value
+  (closure? [v]))
+
+(defprotocol Closure
+  (get-args [c])
+  (get-env [c])
+  (get-body [c]))
+
+(defprotocol Machine
+  (closure [m env args body]))
+
+(defprotocol Environment
+  (lookup-in [env name])
+  (extend-with [env name value]))
+
+(defn secd-dispatch [stack env control dump]
+  (cond
+   (every? empty? [(rest stack) control dump])
+   :return-value
+   (and (every? empty? [(rest stack) control])
+        (first stack)
+        (= (count (first dump)) 3))
+   :continue-from-dump
+   (= 'fn (first (first control)))
+   :push-fn
+   (let [[y [x _]] stack
+         [z] control]
+     (and (= x :int)
+          (= y :succ)
+          (= z :apply)))
+   :inc
+   (let [[c] stack
+         [z] control]
+     (and c
+          (closure? c)
+          (= z :apply)))
+   :run-closure
+   (let [[f [s _]] (first control)]
+     (and (= f :term)
+          (= s :lit)))
+   :push-literal-int
+   (let [[f [s _]] (first control)]
+     (and (= f :term)
+          (= s :var)))
+   :look-up-name
+   (let [[f [s _]] (first control)]
+     (and (= f :term)
+          (= s :lam)))
+   :push-closure
+   (let [[f [s _]] (first control)]
+     (and (= f :term)
+          (= s :app)))
+   :application))
+
+(defn m []
+  (reify
+    Machine
+    (closure [m env args body]
+      (reify
+        Value
+        (closure? [_] true)
+        Closure
+        (get-args [_] args)
+        (get-env [_] env)
+        (get-body [_] body)))))
+
+(extend-type clojure.lang.IPersistentVector
+  Value
+  (closure? [v] (= :closure (first v))))
+
+(extend-type clojure.lang.IPersistentMap
+  Environment
+  (lookup-in [env a-name]
+    (get env a-name (resolve a-name)))
+  (extend-with [env a-name value]
+    (assoc env a-name value)))
+
+(defn secd [machine stack env control dump]
+  (println "secd" stack env control dump)
+  ;; make everything a list and just dispatch on (first ...) ? dunno
+  (condp = (secd-dispatch stack env control dump)
+      :return-value (first stack)
+      :continue-from-dump (let [[[s e c] & dump] dump
+                                stack (conj s (first stack))
+                                env e
+                                control c]
+                            (recur machine stack env control dump))
+      :push-literal-int (let [[[_ [_ n]] & control] control
+                              stack (conj stack [:int n])]
+                          (recur machine stack env control dump))
+      :look-up-name (let [[[_ [_ x]] & control] control
+                          stack (conj stack (lookup-in env x))]
+                      (recur machine stack env control dump))
+      :push-closure (let [[[_ [_ [x t]]] & control] control
+                          stack (conj stack (closure machine env x t))]
+                      (recur machine stack env control dump))
+      :push-fn (let [[[_ opts] & control] control
+                     stack (conj stack (closure machine env nil opts))]
+                 ;;TODO: tag env as being closed over
+                 ;; need to run code generation for closure body here
+                 ;; possibly do something just like run-closure here
+                 ;; to generate code
+                 ;;
+                 ;; so create class writer here
+                 ;; create method writer
+                 ;; class-writer creation will need to happen in the
+                 ;; Machine
+                 ;; - machine state may need to be saved to the dump
+                 ;; may need access to both, so I can lazily write
+                 ;; fields, etc
+                 ;; so the class-writer and method-writer go on the
+                 ;; stack somehow
+                 ;; continuation goes on the dump
+                 ;; the continuation is the current state + the rest
+                 ;; of the procs
+                 ;; the first proc goes on control
+                 ;; extend env with args? maybe push-method-frame can
+                 ;; take care of that
+                 ;; maybe "stack" can be replaced completely by the machine
+                 (recur machine stack env control dump))
+      :application (let [[[_ [_ [t0 t1]]] & control] control
+                         control (conj control :apply [:term t0] [:term t1])]
+                     (recur machine stack env control dump))
+      :inc (let [[_ [_ n] & stack] stack
+                 [_ & control] control
+                 stack (conj stack [:int (inc n)])]
+             (recur machine stack env control dump))
+      :run-closure (let [[c v & stack] stack
+                         e (get-env c)
+                         x (get-args c)
+                         t (get-body c)
+                         [_ & control] control
+                         dump (conj dump [stack env control])
+                         env (extend-with e x v)
+                         control (list [:term t])]
+                     (recur machine stack env control dump))))
+
+(defmn secd
+  "executes a primitve secd machine, takes a data stack, environment map
+  control stack, and dump stack"
+  [(?v . nil) ?e' () ()]
+  v
+
+  [(?v . nil) ?e' () ([?s ?e ?c] . ?d)]
+  (recur (cons v s) e c d)
+
+  [?s ?e ([:term [:lit ?n]] . ?c) ?d]
+  (recur (cons [:int n] s) e c d)
+
+  [?s ?e ([:term [:var ?x]] . ?c) ?d]
+  (recur (cons (get e x) s) e c d)
+
+  [?s ?e ([:term [:lam [?x ?t]]] . ?c) ?d]
+  (recur (cons [:closure [e x t]] s) e c d)
+
+  [?s ?e ([:term [:app [?t0 ?t1]]] . ?c) ?d]
+  (recur s e (list* [:term t1] [:term t0] :apply c) d)
+
+  [(:succ [:int ?n] . ?s) ?e (:apply . ?c) ?d]
+  (recur (cons [:int (inc n)] s) e c d)
+
+  [([:closure [?e' ?x ?t]] ?v . ?s) ?e (:apply . ?c) ?d]
+  (recur () (assoc e' x v) (list [:term t]) (cons [s e c] d))
+
+  [() ?e ((fn ?args . nil) . ?c) ?d]
+  (let [{:keys [name procs]} args
+        frame {:name name
+               :class-writer 'foo}
+        procs (for [[signature code] procs]
+                [:create-method signature code])]
+    ;;pull fn off control stack, put fn writer on value stack,
+    (recur (list*  frame current s)
+           e
+           (concat procs c)
+           d)))
+
+(comment
+
+  [:fun-spec
+   {:name "..."
+    :constants #{}
+    :closed-over #{}
+    :procedures {[signature] body}}]
+
+  )
