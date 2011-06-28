@@ -492,15 +492,20 @@
 (defprotocol CodeGenerator
   (new-procedure-group [cg name interfaces])
   (new-procedure [cg name args])
+  (end-procedure [cg])
+  (new-type [cw name arity])
   (parameter [cg name]))
 
 (defn class-writer [a-name interfaces]
   (let [cw (ClassWriter. ClassWriter/COMPUTE_MAXS)
-        interfaces (into-array String (map #(.getName %) interfaces))]
+        interfaces (->> interfaces
+                        (map #(.getName %))
+                        (map #(.replace % "." "/"))
+                        (into-array String ))]
     (.visit cw Opcodes/V1_5
             (+ Opcodes/ACC_PUBLIC
                Opcodes/ACC_SUPER)
-            (name a-name)
+            (.replace (name a-name) "." "/")
             nil
             (.replace
              (.getName clojure.lang.AFn)
@@ -518,37 +523,76 @@
           env (into {} (map vector args (range)))]
       (reify
         CodeGenerator
+        (end-procedure [_]
+          (doto gen
+            (.returnValue)
+            (.endMethod)))
         (parameter [cg a-name]
           (.loadArg gen (get env a-name)))))))
 
 (defn x []
-  [(reify
-     CodeGenerator
-     (new-procedure-group [cg name interfaces]
-       (class-writer name interfaces)))])
+  (let [v (atom nil)]
+    [(reify
+       clojure.lang.IDeref
+       (deref [_] @v)
+       CodeGenerator
+       (new-procedure-group [cg name interfaces]
+         (let [cw (class-writer name interfaces)
+               m (Method. "<init>" Type/VOID_TYPE (into-array Type []))
+               gen (GeneratorAdapter. Opcodes/ACC_PUBLIC m nil nil cw)]
+           ;;TODO: ctor needs to take into account closed over fields
+           (doto gen
+             (.visitCode)
+             (.loadThis)
+             (.invokeConstructor (Type/getType clojure.lang.AFn)
+                                 (Method/getMethod "void <init>()"))
+             (.returnValue)
+             (.endMethod))
+           cw))
+       (new-type [cw a-name arity]
+         (reset! v (.newInstance (Class/forName (name a-name))))))]))
 
 
 (defmn secd
   "executes a primitve secd machine, takes a data stack, environment map
   control stack, and dump stack"
-  [?s ?e ((arg ?n) . ?c) ?d]
+  [(?gen . nil) ?e () ((:proc-group ?s ?c) . ?d)]
+  (do
+    (end-procedure gen)
+    (recur s e c d))
+  [?s ?e ((m/arg ?n) . ?c) ?d]
   (do
     (parameter (first s) n)
     (recur s e c d))
+  [(?gen . ?s) ?e ((new ?n) . ?c) ?d]
+  (do
+    ;;TODO: need something in place of nil here
+    (new-type gen n nil)
+    (recur (cons gen s) e c d))
   [(?gen . ?s) ?e ((deftype* . ?body) . ?cs) ?d]
   (let [[tag-name class-name fields _ interfaces & bodies] body
         npg (new-procedure-group gen class-name interfaces)
-        dump (cons [cs (cons gen s)] d)
+        dump (cons [cs (cons gen s) class-name] d)
         stack (list npg)
         bodies (for [body bodies]
                  (cons 'proc body))]
     (recur stack e bodies dump))
   [?s ?e ((proc ?name ?args . ?body) . ?c) ?d]
-  (recur (list (new-procedure (first s) name args))
+  (recur (list (new-procedure (first s) name (rest args)))
          e
          body
          (cons [:proc-group s c] d))
+  [(?gen . nil) ?e () ((?c ?s ?cn) . ?d)]
+  (do
+    (.visitEnd gen)
+    (.defineClass @clojure.lang.Compiler/LOADER
+                  (name cn)
+                  (.toByteArray gen)
+                  nil)
+    (recur s e c d))
   [?s ?e ((do . ?body) . ?cs) ?d]
   (recur s e (concat body cs) d)
+  [(?x . nil) ?_ () ()]
+  @x
   [?s ?e ?c ?d]
   (prn s e c d))
