@@ -470,503 +470,85 @@
                                           ~@(apply concat (assoc old-now :body out))])))
         out))))
 
-;; re-write as trampolining multimethod
-;; state machine for interpreting abstract clojure opcodes
-(defn code-gen [command-seq]
-  (loop [[now & later] command-seq stack ()]
-    (condp = (first now)
-        :define-fn (let [[_ & {:keys [name fields body closed-over]}] now
-                         later (rest later)]
-                     (println "define-fn" name)
-                     (recur (concat [[:create-class-writer]
-                                     [:create-static-init]
-                                     [:write-static-fields]
-                                     [:end-static-init]
-                                     [:write-instance-fields]
-                                     [:write-constructor]]
-                                    body
-                                    [[:close-class-writer]
-                                     [:vivify-fun name closed-over]]
-                                    later)
-                            (conj stack
-                                  {:class-name name
-                                   :fields fields
-                                   :closed-over closed-over
-                                   :vars (->> (mapcat (comp (partial map resolve)
-                                                            (partial map second)
-                                                            (partial filter #(= (first %) :free))
-                                                            #(nth % 3))
-                                                      body)
-                                              (reduce
-                                               (fn [accum v]
-                                                 (if (contains? accum v)
-                                                   accum
-                                                   (assoc accum v (count accum))))
-                                               {}))})))
-        :create-class-writer (let [[{:keys [class-name] :as state} & states] stack]
-                               (let [internal-name (.replace (name class-name) "." "/")
-                                     cw (doto (ClassWriter. ClassWriter/COMPUTE_MAXS)
-                                          (.visit Opcodes/V1_5
-                                                  (+ Opcodes/ACC_PUBLIC
-                                                     Opcodes/ACC_SUPER)
-                                                  internal-name
-                                                  nil
-                                                  (.replace (.getName clojure.lang.AFn)
-                                                            "." "/")
-                                                  nil))]
-                                 (recur later (conj states (assoc state
-                                                             :class-writer cw
-                                                             :internal-name internal-name)))))
-        :create-static-init (let [[{:keys [class-writer] :as state} & states] stack]
-                              (let [clinitgen (GeneratorAdapter.
-                                               (+ Opcodes/ACC_PUBLIC
-                                                  Opcodes/ACC_STATIC)
-                                               (Method/getMethod "void <clinit>()")
-                                               nil nil class-writer)]
-                                (recur later (conj states (assoc state :clinitgen clinitgen)))))
-        :write-static-fields (let [[{:keys [fields class-writer constants internal-name clinitgen]}] stack]
-                               (doseq [[field-name [value type]] (concat (->> fields
-                                                                              (filter #(.startsWith
-                                                                                        (first %) "const__"))
-                                                                              (sort-by first))
-                                                                         (->> fields
-                                                                              (remove #(.startsWith
-                                                                                        (first %) "const__"))
-                                                                              (sort-by first)))]
-                                 (.visitField class-writer (+ Opcodes/ACC_PUBLIC
-                                                              Opcodes/ACC_STATIC
-                                                              Opcodes/ACC_FINAL)
-                                              field-name
-                                              (.getDescriptor (Type/getType type))
-                                              nil nil)
-                                 (write-value value clinitgen)
-                                 (.putStatic clinitgen
-                                             (Type/getObjectType internal-name)
-                                             field-name
-                                             (Type/getType type)))
-                               (recur later stack))
-        :write-instance-fields (let [[{:keys [closed-over class-writer internal-name]}] stack]
-                                 (doseq [field-name closed-over]
-                                   (.visitField class-writer (+ Opcodes/ACC_PUBLIC
-                                                                Opcodes/ACC_FINAL)
-                                                (name field-name)
-                                                (.getDescriptor (Type/getType Object))
-                                                nil nil))
-                                 (recur later stack))
-        :cast (let [[{:keys [gen]}] stack
-                    [_ type] now]
-                (.checkCast gen (Type/getType type))
-                (recur later stack))
-        :invoke (let [[{:keys [gen]}] stack
-                      [_ arity] now]
-                  (.invokeInterface gen
-                                    (Type/getType clojure.lang.IFn)
-                                    (Method. "invoke"
-                                             (Type/getType Object)
-                                             (into-array Type
-                                                         (repeat arity (Type/getType Object)))))
-                  (recur later stack))
-        :end-static-init (let [[{:keys [clinitgen] :as state} & states] stack]
-                           (.returnValue clinitgen)
-                           (.endMethod clinitgen)
-                           (recur later (conj states (dissoc state :clinitgen))))
-        :write-constructor (let [[{:keys [class-writer closed-over internal-name]}] stack
-                                 m (Method. "<init>" Type/VOID_TYPE (into-array Type []))]
-                             (println "write-constr" internal-name)
-                             (if (empty? closed-over)
-                               (doto (GeneratorAdapter. Opcodes/ACC_PUBLIC m nil nil class-writer)
-                                 (.visitCode)
-                                 (.loadThis)
-                                 (.invokeConstructor (Type/getType clojure.lang.AFn) m)
-                                 (.returnValue)
-                                 (.endMethod))
-                               (let [m2 (Method. "<init>" Type/VOID_TYPE
-                                                 (into-array Type (repeat (count closed-over)
-                                                                          (Type/getType Object))))
-                                     gen (GeneratorAdapter.
-                                          Opcodes/ACC_PUBLIC m2 nil nil class-writer)]
-                                 (doto (GeneratorAdapter. Opcodes/ACC_PUBLIC m nil nil class-writer)
-                                   (.visitCode)
-                                   (.loadThis)
-                                   (.invokeConstructor (Type/getType clojure.lang.AFn) m)
-                                   (.returnValue)
-                                   (.endMethod))
-                                 (doto gen
-                                   (.visitCode)
-                                   (.loadThis)
-                                   (.invokeConstructor (Type/getObjectType internal-name) m))
-                                 (doall
-                                  (keep-indexed
-                                   (fn [idx the-name]
-                                     (.loadArg gen idx)
-                                     (.putField gen
-                                                (Type/getObjectType internal-name)
-                                                (name the-name)
-                                                (Type/getType Object)))
-                                   (sort closed-over)))
-                                 (doto gen
-                                   (.returnValue)
-                                   (.endMethod))))
-                             (recur later stack))
-        :create-method (let [[{:keys [class-writer] :as state} & states] stack
-                             [_ method-name arity body] now
-                             m (Method. "invoke" (Type/getType Object)
-                                        (into-array Type
-                                                    (repeat arity (Type/getType Object))))
-                             gen (GeneratorAdapter. Opcodes/ACC_PUBLIC m nil nil class-writer)]
-                         (recur (concat body later)
-                                (conj states (assoc state :gen gen))))
-        :push-frame (let [[{:keys [gen internal-name] :as state} & states] stack
-                          [_ frame] now]
-                      (if (empty? frame)
-                        (recur later stack)
-                        (let [locals (zipmap
-                                      (sort frame)
-                                      (map
-                                       (fn [_]
-                                         (.newLocal gen (Type/getType Object))) (sort frame)))]
-                          (recur later (conj stack (update-in state [:locals] merge locals))))))
-        :push-method-frame (let [[state & states] stack
-                                 [_ frame] now
-                                 args (zipmap frame (range (count frame)))]
-                             (if (empty? frame)
-                               (recur later stack)
-                               (recur later (conj stack (assoc state :args args)))))
-        :bind (let [[{:keys [gen locals] :as state} & states] stack
-                    [_ local-name] now]
-                (.storeLocal gen (get locals local-name))
-                (recur later stack))
-        :local (let [[{:keys [gen locals args closed-over internal-name] :as state} & states] stack
-                     [_ local-name] now
-                     tag (resolve (:tag (meta ((set (keys locals)) local-name)) 'Object))]
-                 (if (contains? locals local-name)
-                   (.loadLocal gen (get locals local-name))
-                   (if (contains? args local-name)
-                     (.loadArg gen (get args local-name))
-                     (.getField gen
-                                (Type/getObjectType internal-name)
-                                (name local-name)
-                                (Type/getType Object))))
-                 (when tag
-                   (.checkCast gen (Type/getType tag)))
-                 (recur later stack))
-        :this-fn (let [[{:keys [gen]}] stack]
-                   (.loadThis gen)
-                   (recur later stack))
-        :pop-frame (let [[{:keys [gen internal-name locals args] :as state} & states] stack
-                         [_ frame] now]
-                     (if (empty? frame)
-                       (recur later stack)
-                       (do
-                         (doseq [local-name frame]
-                           (.visitInsn gen Opcodes/ACONST_NULL)
-                           (if (contains? locals local-name)
-                             (.storeLocal gen (get locals local-name))
-                             (.storeArg gen (get args local-name))))
-                         (recur later states))))
-        :get-field (let [[{:keys [gen internal-name] :as state} & states] stack
-                         [_ field-name field-type] now]
-                     (.getStatic gen
-                                 (Type/getObjectType internal-name)
-                                 field-name
-                                 (Type/getType field-type))
-                     (recur later stack))
-        ::keyword (let [[{:keys [gen]}] stack
-                        [_ k] now]
-                    (if (nil? (namespace k))
-                      (.visitInsn gen Opcodes/ACONST_NULL)
-                      (.push gen (namespace k)))
-                    (doto gen
-                      (.push (name k))
-                      (.invokeStatic (Type/getType clojure.lang.Keyword)
-                                     (Method/getMethod
-                                      "clojure.lang.Keyword intern(String,String)")))
-                    (recur later stack))
-        ::symbol (let [[{:keys [gen]}] stack
-                       [_ k] now]
-                   (if (nil? (namespace k))
-                     (.visitInsn gen Opcodes/ACONST_NULL)
-                     (.push gen (namespace k)))
-                   (doto gen
-                     (.push (name k))
-                     (.invokeStatic (Type/getType clojure.lang.Symbol)
-                                    (Method/getMethod
-                                     "clojure.lang.Symbol intern(String,String)")))
-                   (recur later stack))
-        :return (let [[{:keys [gen class-name internal-name] :as state} & states] stack]
-                  (doto gen
-                    (.returnValue)
-                    (.endMethod))
-                  (recur later (conj states (dissoc state :gen))))
-        :bind-var (let [[{:keys [gen]}] stack
-                        [_ var-name] now
-                        var-name (name var-name)
-                        var-ns-name (name (ns-name *ns*))]
-                    (doto gen
-                      (.push var-ns-name)
-                      (.swap)
-                      (.push var-name)
-                      (.swap)
-                      (.invokeStatic (Type/getType clojure.lang.RT)
-                                     (Method/getMethod
-                                      "clojure.lang.Var var(String,String,Object)")))
-                    (recur later stack))
-        :call-method (let [[{:keys [gen]}] stack
-                           [_ [return method-name target & args]] now]
-                       (doto gen
-                         (.invokeInterface (Type/getType target)
-                                           (Method/getMethod
-                                            (format "%s %s()"
-                                                    (.getName return)
-                                                    method-name))))
-                       (recur later stack))
-        :close-class-writer (let [[{:keys [class-writer class-name]}] stack]
-                              (.visitEnd class-writer)
-                              (let [f (java.io.File.
-                                       (str "/tmp/foo/"
-                                            (.replace (name class-name) "." "/")
-                                            ".class"))]
-                                (.mkdirs (.getParentFile f))
-                                (clojure.java.io/copy
-                                 (.toByteArray class-writer)
-                                 f))
-                              (define-class (name class-name) (.toByteArray class-writer))
-                              (recur later (pop stack)))
-        ::vivify-fun (let [[{:keys [gen internal-name] :as state} & states] stack
-                           [_ class-name closed-over] now]
-                       (.invokeConstructor gen (Type/getObjectType
-                                                (.replace (name class-name) "." "/"))
-                                           (Method. "<init>" Type/VOID_TYPE
-                                                    (into-array Type (repeat (count closed-over)
-                                                                             (Type/getType Object)))))
-                       (recur later stack))
-        :vivify-fun (let [[{:keys [gen internal-name] :as state} & states] stack
-                          [_ class-name closed-over] now]
-                      (if gen
-                        (do
-                          (doto gen
-                            (.newInstance (Type/getObjectType (.replace (name class-name) "." "/")))
-                            (.dup))
-                          (if (empty? closed-over)
-                            (do
-                              (.invokeConstructor gen (Type/getObjectType
-                                                       (.replace (name class-name) "." "/"))
-                                                  (Method/getMethod "void <init>()"))
-                              (recur later stack))
-                            (recur (concat (map #(vector :local %)
-                                                (sort closed-over))
-                                           [[::vivify-fun class-name closed-over]]
-                                           later)
-                                   stack)))
-                        (recur later (conj stack (.newInstance (load-class (name class-name)))))))
-        :halt [now later stack]
-        (do
-          (println "stack")
-          (clojure.pprint/pprint stack)
-          (println "later")
-          (clojure.pprint/pprint later)
-          (println "now")
-          (clojure.pprint/pprint now)
-          (throw
-           (Exception.
-            "unknown op"))))))
+;; TODO: deal with primitive args somehow?
+;; TODO: handle apply, handle var args, handle everything.
+;; TODO: needs to generate a replacement for AFn
+;; TODO: find closed over locals, turn into fields
+;; TODO: args need to be (arg ...)
+(defn fn->deftype [[_ & body] env]
+  (let [class-name (gensym 'x.fn)]
+    `(do
+       (deftype*
+         IFn
+         ~class-name
+         []
+         :implements [clojure.lang.Fn
+                      clojure.lang.IFn]
+         ~@(for [[args & bs] body]
+             `(~'invoke ~(vec (cons '_ args))
+                        ~@bs)))
+       (new ~class-name))))
 
-(defn eval [form]
-  (let [x (->> (line-up `(fn* ([] ~form)))
-               find-closed-over-locals
-               resolve-vars
-               qualify-fns
-               pool-constants
-               pool-vars
-               rewrite-field-access
-               merge-pools
-               explicit-fn-casts
-               identity)]
-    (clojure.pprint/pprint x)
-    (.invoke (first (last (code-gen (conj x [:halt])))))))
+(defprotocol CodeGenerator
+  (new-procedure-group [cg name interfaces])
+  (new-procedure [cg name args])
+  (parameter [cg name]))
 
-(defprotocol Value
-  (closure? [v]))
+(defn class-writer [a-name interfaces]
+  (let [cw (ClassWriter. ClassWriter/COMPUTE_MAXS)
+        interfaces (into-array String (map #(.getName %) interfaces))]
+    (.visit cw Opcodes/V1_5
+            (+ Opcodes/ACC_PUBLIC
+               Opcodes/ACC_SUPER)
+            (name a-name)
+            nil
+            (.replace
+             (.getName clojure.lang.AFn)
+             "." "/")
+            interfaces)
+    cw))
 
-(defprotocol Closure
-  (get-args [c])
-  (get-env [c])
-  (get-body [c]))
-
-(defprotocol Machine
-  (closure [m env args body]))
-
-(defprotocol Environment
-  (lookup-in [env name])
-  (extend-with [env name value]))
-
-(defn secd-dispatch [stack env control dump]
-  (cond
-   (every? empty? [(rest stack) control dump])
-   :return-value
-   (and (every? empty? [(rest stack) control])
-        (first stack)
-        (= (count (first dump)) 3))
-   :continue-from-dump
-   (= 'fn (first (first control)))
-   :push-fn
-   (let [[y [x _]] stack
-         [z] control]
-     (and (= x :int)
-          (= y :succ)
-          (= z :apply)))
-   :inc
-   (let [[c] stack
-         [z] control]
-     (and c
-          (closure? c)
-          (= z :apply)))
-   :run-closure
-   (let [[f [s _]] (first control)]
-     (and (= f :term)
-          (= s :lit)))
-   :push-literal-int
-   (let [[f [s _]] (first control)]
-     (and (= f :term)
-          (= s :var)))
-   :look-up-name
-   (let [[f [s _]] (first control)]
-     (and (= f :term)
-          (= s :lam)))
-   :push-closure
-   (let [[f [s _]] (first control)]
-     (and (= f :term)
-          (= s :app)))
-   :application))
-
-(defn m []
-  (reify
-    Machine
-    (closure [m env args body]
+(extend-type ClassWriter
+  CodeGenerator
+  (new-procedure [class-writer a-name args]
+    (let [m (Method. (name a-name) (Type/getType Object)
+                     (into-array Type (repeat (count args)
+                                              (Type/getType Object))))
+          gen (GeneratorAdapter. Opcodes/ACC_PUBLIC m nil nil class-writer)
+          env (into {} (map vector args (range)))]
       (reify
-        Value
-        (closure? [_] true)
-        Closure
-        (get-args [_] args)
-        (get-env [_] env)
-        (get-body [_] body)))))
+        CodeGenerator
+        (parameter [cg a-name]
+          (.loadArg gen (get env a-name)))))))
 
-(extend-type clojure.lang.IPersistentVector
-  Value
-  (closure? [v] (= :closure (first v))))
+(defn x []
+  [(reify
+     CodeGenerator
+     (new-procedure-group [cg name interfaces]
+       (class-writer name interfaces)))])
 
-(extend-type clojure.lang.IPersistentMap
-  Environment
-  (lookup-in [env a-name]
-    (get env a-name (resolve a-name)))
-  (extend-with [env a-name value]
-    (assoc env a-name value)))
-
-(defn secd [machine stack env control dump]
-  (println "secd" stack env control dump)
-  ;; make everything a list and just dispatch on (first ...) ? dunno
-  (condp = (secd-dispatch stack env control dump)
-      :return-value (first stack)
-      :continue-from-dump (let [[[s e c] & dump] dump
-                                stack (conj s (first stack))
-                                env e
-                                control c]
-                            (recur machine stack env control dump))
-      :push-literal-int (let [[[_ [_ n]] & control] control
-                              stack (conj stack [:int n])]
-                          (recur machine stack env control dump))
-      :look-up-name (let [[[_ [_ x]] & control] control
-                          stack (conj stack (lookup-in env x))]
-                      (recur machine stack env control dump))
-      :push-closure (let [[[_ [_ [x t]]] & control] control
-                          stack (conj stack (closure machine env x t))]
-                      (recur machine stack env control dump))
-      :push-fn (let [[[_ opts] & control] control
-                     stack (conj stack (closure machine env nil opts))]
-                 ;;TODO: tag env as being closed over
-                 ;; need to run code generation for closure body here
-                 ;; possibly do something just like run-closure here
-                 ;; to generate code
-                 ;;
-                 ;; so create class writer here
-                 ;; create method writer
-                 ;; class-writer creation will need to happen in the
-                 ;; Machine
-                 ;; - machine state may need to be saved to the dump
-                 ;; may need access to both, so I can lazily write
-                 ;; fields, etc
-                 ;; so the class-writer and method-writer go on the
-                 ;; stack somehow
-                 ;; continuation goes on the dump
-                 ;; the continuation is the current state + the rest
-                 ;; of the procs
-                 ;; the first proc goes on control
-                 ;; extend env with args? maybe push-method-frame can
-                 ;; take care of that
-                 ;; maybe "stack" can be replaced completely by the machine
-                 (recur machine stack env control dump))
-      :application (let [[[_ [_ [t0 t1]]] & control] control
-                         control (conj control :apply [:term t0] [:term t1])]
-                     (recur machine stack env control dump))
-      :inc (let [[_ [_ n] & stack] stack
-                 [_ & control] control
-                 stack (conj stack [:int (inc n)])]
-             (recur machine stack env control dump))
-      :run-closure (let [[c v & stack] stack
-                         e (get-env c)
-                         x (get-args c)
-                         t (get-body c)
-                         [_ & control] control
-                         dump (conj dump [stack env control])
-                         env (extend-with e x v)
-                         control (list [:term t])]
-                     (recur machine stack env control dump))))
 
 (defmn secd
   "executes a primitve secd machine, takes a data stack, environment map
   control stack, and dump stack"
-  [(?v . nil) ?e' () ()]
-  v
-
-  [(?v . nil) ?e' () ([?s ?e ?c] . ?d)]
-  (recur (cons v s) e c d)
-
-  [?s ?e ([:term [:lit ?n]] . ?c) ?d]
-  (recur (cons [:int n] s) e c d)
-
-  [?s ?e ([:term [:var ?x]] . ?c) ?d]
-  (recur (cons (get e x) s) e c d)
-
-  [?s ?e ([:term [:lam [?x ?t]]] . ?c) ?d]
-  (recur (cons [:closure [e x t]] s) e c d)
-
-  [?s ?e ([:term [:app [?t0 ?t1]]] . ?c) ?d]
-  (recur s e (list* [:term t1] [:term t0] :apply c) d)
-
-  [(:succ [:int ?n] . ?s) ?e (:apply . ?c) ?d]
-  (recur (cons [:int (inc n)] s) e c d)
-
-  [([:closure [?e' ?x ?t]] ?v . ?s) ?e (:apply . ?c) ?d]
-  (recur () (assoc e' x v) (list [:term t]) (cons [s e c] d))
-
-  [() ?e ((fn ?args . nil) . ?c) ?d]
-  (let [{:keys [name procs]} args
-        frame {:name name
-               :class-writer 'foo}
-        procs (for [[signature code] procs]
-                [:create-method signature code])]
-    ;;pull fn off control stack, put fn writer on value stack,
-    (recur (list*  frame current s)
-           e
-           (concat procs c)
-           d)))
-
-(comment
-
-  [:fun-spec
-   {:name "..."
-    :constants #{}
-    :closed-over #{}
-    :procedures {[signature] body}}]
-
-  )
+  [?s ?e ((arg ?n) . ?c) ?d]
+  (do
+    (parameter (first s) n)
+    (recur s e c d))
+  [(?gen . ?s) ?e ((deftype* . ?body) . ?cs) ?d]
+  (let [[tag-name class-name fields _ interfaces & bodies] body
+        npg (new-procedure-group gen class-name interfaces)
+        dump (cons [cs (cons gen s)] d)
+        stack (list npg)
+        bodies (for [body bodies]
+                 (cons 'proc body))]
+    (recur stack e bodies dump))
+  [?s ?e ((proc ?name ?args . ?body) . ?c) ?d]
+  (recur (list (new-procedure (first s) name args))
+         e
+         body
+         (cons [:proc-group s c] d))
+  [?s ?e ((do . ?body) . ?cs) ?d]
+  (recur s e (concat body cs) d)
+  [?s ?e ?c ?d]
+  (prn s e c d))
