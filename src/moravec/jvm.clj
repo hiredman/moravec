@@ -49,18 +49,30 @@
                   (.toByteArray class-writer)
                   nil))
   (new-procedure-group [cg name interfaces]
-         (let [cw (class-writer name interfaces)
-               m (Method. "<init>" Type/VOID_TYPE (into-array Type []))
-               gen (GeneratorAdapter. Opcodes/ACC_PUBLIC m nil nil cw)]
-           ;;TODO: ctor needs to take into account closed over fields
-           (doto gen
-             (.visitCode)
-             (.loadThis)
-             (.invokeConstructor (Type/getType clojure.lang.AFn)
-                                 (Method/getMethod "void <init>()"))
-             (.returnValue)
-             (.endMethod))
-           cw))
+    (class-writer name interfaces))
+  (write-constructor [cw fields env]
+    (prn 'write-constructor)
+    (let [m (Method. "<init>" Type/VOID_TYPE
+                     (into-array Type (repeat (count fields)
+                                              (Type/getType Object))))
+          gen (GeneratorAdapter. Opcodes/ACC_PUBLIC m nil nil cw)]
+      (doto gen
+        (.visitCode)
+        (.loadThis)
+        (.invokeConstructor (Type/getType clojure.lang.AFn)
+                            (Method/getMethod "void <init>()")))
+      (doseq [[f idx] (map vector fields (range))]
+        (.loadThis gen)
+        (.loadArg gen idx)
+        (.putField gen
+                   (Type/getObjectType
+                    (.replace (name (second (:this-class env))) "." "/"))
+                   (name f)
+                   (Type/getType Object)))
+      (doto gen
+        (.returnValue)
+        (.endMethod))
+      cw))
   (field [cw the-name]
     (.visitField cw (+ Opcodes/ACC_FINAL) (name the-name) (.getDescriptor (Type/getType Object)) nil nil))
   (new-procedure [this-class-writer a-name args]
@@ -106,10 +118,11 @@
              (= kind :arg)
              (.loadArg gen place)
              (= kind :closed-over)
-             (.getField gen
-                        (Type/getObjectType (.replace (name (second (:this-class env))) "." "/"))
-                        (name local-name)
-                        (Type/getType Object))
+             (doto gen
+               (.loadThis)
+               (.getField (Type/getObjectType (.replace (name (second (:this-class env))) "." "/"))
+                          (name local-name)
+                          (Type/getType Object)))
              :else (throw (Exception. "load arg")))))))))
 
 ;; This is kind of a hack for eval
@@ -120,18 +133,7 @@
        (deref [_] @v)
        CodeGenerator
        (new-procedure-group [cg name interfaces]
-         (let [cw (class-writer name interfaces)
-               m (Method. "<init>" Type/VOID_TYPE (into-array Type []))
-               gen (GeneratorAdapter. Opcodes/ACC_PUBLIC m nil nil cw)]
-           ;;TODO: ctor needs to take into account closed over fields
-           (doto gen
-             (.visitCode)
-             (.loadThis)
-             (.invokeConstructor (Type/getType clojure.lang.AFn)
-                                 (Method/getMethod "void <init>()"))
-             (.returnValue)
-             (.endMethod))
-           cw))
+         (class-writer name interfaces))
        (constructor [cg class-name]
          (reify
            ConstructorBuilder

@@ -62,7 +62,8 @@
   (finish [cw name])
   (local [cw name env])
   (field [cw name])
-  (constructor [cw name]))
+  (constructor [cw name])
+  (write-constructor [cw fields env]))
 
 (defprotocol ConstructorBuilder
   (arguments [cw])
@@ -132,7 +133,11 @@
     (end-ctor-call cx argc)
     (recur s e c d))
 
-
+  [?s ?e ((m/create-constructor ?fields) . ?c) ?d]
+  (do
+    (write-constructor (first s) fields e)
+    (recur s e c d))
+  
   ;; TODO: deftype* needs to support static fields and static init
   [(?gen . ?s) ?e ((deftype* . ?body) . ?cs) ?d]
   (let [[tag-name class-name fields _ interfaces & bodies] body
@@ -141,13 +146,14 @@
         stack (list npg)
         bodies (for [body bodies]
                  (cons 'proc body))
-        fields (for [f fields]
+        fields-ins (for [f fields]
                  (list 'make-field f))
         e (assoc (->> (for [[n [kind idx]] e]
                         [n [:closed-over -1]])
                       (into {}))
             :this-class ['_ class-name])]
-    (recur stack e (concat fields bodies) dump))
+    (recur stack e
+           (concat fields-ins [`(m/create-constructor ~fields)] bodies) dump))
 
 
   ;; (do ...)
