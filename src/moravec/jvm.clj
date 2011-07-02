@@ -1,4 +1,5 @@
 (ns moravec.jvm
+  (:refer-clojure :exclude [eval])
   (:use [moravec.four])
   (:import (clojure.asm ClassWriter Opcodes Type)
            (clojure.asm.commons Method GeneratorAdapter)))
@@ -36,8 +37,6 @@
 
 (extend-type ClassWriter
   CodeGenerator
-  (native-call [cw target name]
-    )
   (finish [class-writer a-name]
     (.visitEnd class-writer)
     (clojure.java.io/copy
@@ -96,18 +95,7 @@
                (Method. "<init>" Type/VOID_TYPE (into-array Type (repeat argc (Type/getType Object))))))))
         (new-procedure-group [cg class-name interfaces]
           (println 'new-proc)
-          (let [cw (class-writer class-name interfaces)
-                m (Method. "<init>" Type/VOID_TYPE (into-array Type []))
-                gen (GeneratorAdapter. Opcodes/ACC_PUBLIC m nil nil cw)]
-            ;;TODO: ctor needs to take into account closed over fields
-            (doto gen
-              (.visitCode)
-              (.loadThis)
-              (.invokeConstructor (Type/getType clojure.lang.AFn)
-                                  (Method/getMethod "void <init>()"))
-              (.returnValue)
-              (.endMethod))
-            cw))
+          (class-writer class-name interfaces))
         (end-procedure [_]
           (doto gen
             (.returnValue)
@@ -140,3 +128,6 @@
            (arguments [_] cg)
            (end-ctor-call [_ argc]
              (reset! v (.newInstance (Class/forName (name class-name))))))))]))
+
+(defn eval [form]
+  (@(secd (x) {} (list `(fn* [] ~form)) ())))

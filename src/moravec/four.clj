@@ -29,14 +29,13 @@
           `(fn* ~@(:bodies result)))
         (meta form)))))
 
-;; TODO: generate proper constructors for closed over stuff
-;; TODO: general macro for walking code and rewriting
 ;; TODO: deal with primitive args somehow?
 ;; TODO: handle apply, handle var args, handle everything.
 ;; TODO: needs to generate a replacement for AFn
 ;; TODO: clojure.lang.RestFn
 ;; TODO: once support
 ;; TODO: let support
+;; TODO: constant pooling - static fields map
 (defn fn->deftype [form env]
   (let [class-name (gensym (str *ns* "$" 'fn))
         closed-over (vec (filter #(closed-over? % form) (keys env)))
