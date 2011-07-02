@@ -3,6 +3,8 @@
   (:import (clojure.asm ClassWriter Opcodes Type)
            (clojure.asm.commons Method GeneratorAdapter)))
 
+(def counter (atom 0))
+
 (defn define-class [class-name bytes]
   (.defineClass @clojure.lang.Compiler/LOADER
                 class-name
@@ -40,7 +42,8 @@
     (.visitEnd class-writer)
     (clojure.java.io/copy
      (.toByteArray class-writer)
-     (clojure.java.io/file "/tmp/foo1.class"))
+     (clojure.java.io/file (format "/tmp/foo%s.class" @counter)))
+    (swap! counter inc)
     (.defineClass @clojure.lang.Compiler/LOADER
                   (name a-name)
                   (.toByteArray class-writer)
@@ -60,9 +63,6 @@
            cw))
   (field [cw the-name]
     (.visitField cw (+ Opcodes/ACC_FINAL) (name the-name) (.getDescriptor (Type/getType Object)) nil nil))
-  (arguments [this] this)
-  (new-type [this name argc]
-    (println 'foo this name argc))
   (new-procedure [this-class-writer a-name args]
     (let [m (Method. (name a-name) (Type/getType Object)
                      (into-array Type (repeat (count args)
@@ -71,9 +71,17 @@
       (reify
         CodeGenerator
         (finish [cw n] (prn 'finish 1))
-        (arguments [this] this)
-        (new-type [this name argc]
-          (println 'foo this name argc))
+        (constructor [cw type-name]
+          (.newInstance
+           gen (Type/getObjectType (.replace (name type-name) "." "/")))
+          (.dup gen)
+          (reify
+            ConstructorBuilder
+            (arguments [_] cw)
+            (end-ctor-call [_ argc]
+              (.invokeConstructor
+               gen (Type/getObjectType (.replace (name type-name) "." "/"))
+               (Method. "<init>" Type/VOID_TYPE (into-array Type (repeat argc (Type/getType Object))))))))
         (new-procedure-group [cg class-name interfaces]
           (println 'new-proc)
           (let [cw (class-writer class-name interfaces)
@@ -124,6 +132,9 @@
              (.returnValue)
              (.endMethod))
            cw))
-       (arguments [this] this)
-       (new-type [cw a-name arity]
-         (reset! v (.newInstance (Class/forName (name a-name))))))]))
+       (constructor [cg class-name]
+         (reify
+           ConstructorBuilder
+           (arguments [_] cg)
+           (end-ctor-call [_ argc]
+             (reset! v (.newInstance (Class/forName (name class-name))))))))]))

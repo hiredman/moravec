@@ -29,6 +29,7 @@
           `(fn* ~@(:bodies result)))
         (meta form)))))
 
+;; TODO: generate proper constructors for closed over stuff
 ;; TODO: general macro for walking code and rewriting
 ;; TODO: deal with primitive args somehow?
 ;; TODO: handle apply, handle var args, handle everything.
@@ -56,18 +57,21 @@
   (new-procedure-group [cg name interfaces])
   (new-procedure [cg name args])
   (end-procedure [cg])
-  (arguments [cw])
   (parameter [cg name])
   (native-call [cg target name])
   (finish [cw name])
   (local [cw name env])
   (field [cw name])
-  (new-type [cw name argc]))
+  (constructor [cw name]))
+
+(defprotocol ConstructorBuilder
+  (arguments [cw])
+  (end-ctor-call [cw argc]))
 
 ;; TODO: s doesn't seem to need to be a stack
 
 (defmn secd
-
+  
   ;; methods for deftype
   [(?gen . nil) ?e () ((:proc-group ?s ?c) . ?d)]
   (do
@@ -109,25 +113,24 @@
   (do
     (prn 'm/new)
     (prn 'stack sx)
-    (new-type (first sx) n argc)
+    #_(new-type (first sx) n argc)
+    (throw (Exception. "m/new"))
     (recur s e c d))
 
   ;; (new ... ...)
   [?s ?e ((new ?n . ?args) . ?c) ?d]
-  (do
-    (prn 'new (count args))
-    (let [stack [(arguments (first s))]
-          control (concat args [`(m/new ~n ~(count args))])
-          dump (list* [s e c] d)]
-      (recur stack e control dump)))
+  (let [constructor-builder (constructor (first s) n)
+        stack (list (arguments constructor-builder) constructor-builder)
+        env e
+        control (concat args [`(m/end-constructor ~(count args))])
+        dump (list* [s e c] d)]
+    (prn 'control-new control)
+    (recur stack env control dump))
 
-  [?s ?e ((new ?n) . ?c) ?d]
+  [(?sx ?cx . nil) ?ex ((m/end-constructor ?argc) . nil) ((?s ?e ?c) . ?d)]
   (do
-    (prn 'new 0)
-    (let [stack [(arguments (first s))]
-          control (list `(m/new ~n 0))
-          dump (list* [s e c] d)]
-      (recur stack e control dump)))
+    (end-ctor-call cx argc)
+    (recur s e c d))
 
 
   ;; TODO: deftype* needs to support static fields and static init
@@ -154,9 +157,7 @@
     (recur s e (concat body cs) d))
 
   [(?x . nil) ?_ () ()]
-  (do
-    (prn 'done)
-    x)
+  x
   
   [?s ?e (?c . ?cs) ?d]
   (do (println 'stack s)
@@ -171,7 +172,10 @@
                                   (do
                                     (local gen c e)
                                     (recur (cons gen s) e cs d))
-                                  (throw (Exception. "var resultion")))
+                                  (do
+                                    (println 'control c cs)
+                                    (println 'stack s gen)
+                                    (throw (Exception. "var resultion"))))
             (throw (Exception. "blarg"))))))
 
   [(?gen . nil) ?_ () ((?c ?s ?cn ?e) . ?d)]
