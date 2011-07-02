@@ -1,92 +1,188 @@
 (ns moravec.four
   (:refer-clojure :exclude [eval])
-  (:use [match.core :only [defmn mn]]))
+  (:use [match.core :only [defmn mn]]
+        [moravec.five]))
 
+(defn normalize-fn [form]
+  (loop [[cur & forms] form result {:bodies []}]
+    (if cur
+      (cond
+       (and (= cur 'fn*)
+            (symbol? (first forms)))
+       (recur (rest forms) (assoc result :fn-name (first forms)))
+       (= cur 'fn*)
+       (do
+         (when-not (or (every? seq? forms)
+                       (vector? (first forms)))
+           (throw (Exception. "malformed fn form")))
+         (recur forms result))
+       (vector? cur)
+       (recur nil (assoc result :bodies [(list* cur forms)]))
+       (seq? cur)
+       (recur forms (update-in result [:bodies] conj cur))
+       :else
+       (throw (Exception. "unknown fn form")))
+      (with-meta
+        (if (:fn-name result)
+          `(fn* ~(:fn-name result)
+                ~@(:bodies result))
+          `(fn* ~@(:bodies result)))
+        (meta form)))))
+
+;; TODO: general macro for walking code and rewriting
 ;; TODO: deal with primitive args somehow?
 ;; TODO: handle apply, handle var args, handle everything.
 ;; TODO: needs to generate a replacement for AFn
-;; TODO: find closed over locals, turn into fields
-;; TODO: args need to be (arg ...)
 ;; TODO: clojure.lang.RestFn
 ;; TODO: once support
-(defn fn->deftype [[_ & body] env]
-  (let [class-name (gensym 'x.fn)]
+;; TODO: let support
+(defn fn->deftype [form env]
+  (let [class-name (gensym (str *ns* "$" 'fn))
+        closed-over (vec (filter #(closed-over? % form) (keys env)))
+        [_ & body] (normalize-fn form)
+        bodies (for [[args & bs] body]
+                 `(~'invoke ~(vec (cons '_ args)) ~@bs))]
     `(do
        (deftype*
          IFn
          ~class-name
-         []
+         ~closed-over
          :implements [clojure.lang.Fn
                       clojure.lang.IFn]
-         ~@(for [[args & bs] body]
-             `(~'invoke ~(vec (cons '_ args))
-                        ~@bs)))
-       (new ~class-name))))
+         ~@bodies)
+       (new ~class-name ~@closed-over))))
 
 (defprotocol CodeGenerator
   (new-procedure-group [cg name interfaces])
   (new-procedure [cg name args])
   (end-procedure [cg])
-  (new-type [cw name arity])
+  (arguments [cw])
   (parameter [cg name])
   (native-call [cg target name])
-  (finish [cw name]))
+  (finish [cw name])
+  (local [cw name env])
+  (field [cw name])
+  (new-type [cw name argc]))
+
+;; TODO: s doesn't seem to need to be a stack
 
 (defmn secd
+
+  ;; methods for deftype
   [(?gen . nil) ?e () ((:proc-group ?s ?c) . ?d)]
   (do
+    (prn 'methods)
     (end-procedure gen)
+    (prn 'methods2)
     (recur s e c d))
 
-  ;; Arguments
-  [?s ?e ((m/arg ?n) . ?c) ?d]
+  [?s ?e ((proc ?name ?args . ?body) . ?c) ?d]
   (do
-    (parameter (first s) n)
+    (prn 'new-proc)
+    (recur (list (new-procedure (first s) name (rest args)))
+           (into e (map vector args
+                        (map (partial vector :arg) (map dec (range)))))
+           body
+           (cons [:proc-group s c] d)))
+
+  [?s ?e ((make-field ?f) . ?c) ?d]
+  (do
+    (prn 'make-field)
+    (field (first s) f)
     (recur s e c d))
 
-  [?s ?e ((m/dot . ?args) . ?c) ?d]
+  [?s ?e ((fn* . ?args) . ?c) ?d]
+  (do
+    (prn 'fn*)
+    (recur s e (list* (fn->deftype `(fn* ~@args) e) c) d))
+  
+  [(?gen . ?s) ?e ((m/dot . ?args) . ?c) ?d]
   ;; TODO: use top of stack to create native call generator
   ;; TODO: native call generator
-  (let [stack s
+  (let [stack []
         env e
         control c
-        dump d]
+        dump (list* [:native e c s]  d)]
     (recur stack env control dump))
 
-  ;; (new ... ...)
-  [(?gen . ?s) ?e ((new ?n) . ?c) ?d]
+  [?sx ?ex ((m/new ?n ?argc) . nil) ((?s ?e ?c) . ?d)]
   (do
-    ;;TODO: need something in place of nil here
-    (new-type gen n nil)
-    (recur (cons gen s) e c d))
+    (prn 'm/new)
+    (prn 'stack sx)
+    (new-type (first sx) n argc)
+    (recur s e c d))
+
+  ;; (new ... ...)
+  [?s ?e ((new ?n . ?args) . ?c) ?d]
+  (do
+    (prn 'new (count args))
+    (let [stack [(arguments (first s))]
+          control (concat args [`(m/new ~n ~(count args))])
+          dump (list* [s e c] d)]
+      (recur stack e control dump)))
+
+  [?s ?e ((new ?n) . ?c) ?d]
+  (do
+    (prn 'new 0)
+    (let [stack [(arguments (first s))]
+          control (list `(m/new ~n 0))
+          dump (list* [s e c] d)]
+      (recur stack e control dump)))
+
 
   ;; TODO: deftype* needs to support static fields and static init
   [(?gen . ?s) ?e ((deftype* . ?body) . ?cs) ?d]
   (let [[tag-name class-name fields _ interfaces & bodies] body
         npg (new-procedure-group gen class-name interfaces)
-        dump (cons [cs (cons gen s) class-name] d)
+        dump (cons [cs (cons gen s) class-name e] d)
         stack (list npg)
         bodies (for [body bodies]
-                 (cons 'proc body))]
-    (recur stack e bodies dump))
+                 (cons 'proc body))
+        fields (for [f fields]
+                 (list 'make-field f))
+        e (assoc (->> (for [[n [kind idx]] e]
+                        [n [:closed-over -1]])
+                      (into {}))
+            :this-class ['_ class-name])]
+    (recur stack e (concat fields bodies) dump))
 
-  [?s ?e ((proc ?name ?args . ?body) . ?c) ?d]
-  (recur (list (new-procedure (first s) name (rest args)))
-         e
-         body
-         (cons [:proc-group s c] d))
-
-  [(?gen . nil) ?e () ((?c ?s ?cn) . ?d)]
-  (do
-    (finish gen cn)
-    (recur s e c d))
 
   ;; (do ...)
   [?s ?e ((do . ?body) . ?cs) ?d]
-  (recur s e (concat body cs) d)
+  (do
+    (prn 'do)
+    (recur s e (concat body cs) d))
 
   [(?x . nil) ?_ () ()]
-  x
+  (do
+    (prn 'done)
+    x)
+  
+  [?s ?e (?c . ?cs) ?d]
+  (do (println 'stack s)
+      (let [gen (first s)
+            s (rest s)]
+        (do
+          (prn 'something)
+          (prn 'stack s)
+          (prn 'gen gen)
+          (condp isa? (type c)
+            clojure.lang.Symbol (if (contains? e c)
+                                  (do
+                                    (local gen c e)
+                                    (recur (cons gen s) e cs d))
+                                  (throw (Exception. "var resultion")))
+            (throw (Exception. "blarg"))))))
 
+  [(?gen . nil) ?_ () ((?c ?s ?cn ?e) . ?d)]
+  (do
+    (prn 'finish)
+    (prn 'gen gen)
+    (prn 'c c 's s 'cn cn 'e e 'd d)
+    (finish gen cn)
+    (prn 'post-finish)
+    (recur s e c d))
+  
   [?s ?e ?c ?d]
-  (prn s e c d))
+  (prn 'fallback s e c d)
+)
