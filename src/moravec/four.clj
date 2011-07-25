@@ -36,6 +36,7 @@
 ;; TODO: once support
 ;; TODO: let support
 ;; TODO: constant pooling - static fields map
+;; TODO: mayber leave constant pooling to bytecode generation
 (defn fn->deftype [form env]
   (let [class-name (gensym (str *ns* "$" 'fn))
         closed-over (vec (filter #(closed-over? % form) (keys env)))
@@ -62,18 +63,31 @@
   (local [cw name env])
   (field [cw name])
   (constructor [cw name])
-  (write-constructor [cw fields env]))
+  (write-constructor [cw fields env])
+  (literal [cg value]))
 
 (defprotocol ConstructorBuilder
   (arguments [cw])
   (end-ctor-call [cw argc]))
 
 ;; TODO: s doesn't seem to need to be a stack
+;; TODO: document how I am testing this thing
+;; TODO: give up all pretense of secd machine
+;; DONE: use dead-end macros for tags
+
+(defmacro dead-end [name]
+  (let [error (format "%s is a dead macro used by the compiler"
+                      name)]
+    `(defmacro ~name [& _#]
+       (throw (Exception. ~error)))))
+
+(dead-end proc-group)
+(dead-end fn-call)
 
 (defmn secd
-  
+
   ;; methods for deftype
-  [(?gen . nil) ?e () ((:proc-group ?s ?c) . ?d)]
+  [(?gen . nil) ?e () ((moravec.four/proc-group ?s ?c) . ?d)]
   (do
     (prn 'methods)
     (end-procedure gen)
@@ -87,7 +101,7 @@
            (into e (map vector args
                         (map (partial vector :arg) (map dec (range)))))
            body
-           (cons [:proc-group s c] d)))
+           (cons [`proc-group s c] d)))
 
   [?s ?e ((make-field ?f) . ?c) ?d]
   (do
@@ -99,10 +113,11 @@
   (do
     (prn 'fn*)
     (recur s e (list* (fn->deftype `(fn* ~@args) e) c) d))
-  
+
   [(?gen . ?s) ?e ((m/dot . ?args) . ?c) ?d]
   ;; TODO: use top of stack to create native call generator
   ;; TODO: native call generator
+  ;; TODO: build up types in arg-builder
   (let [stack []
         env e
         control c
@@ -136,7 +151,7 @@
   (do
     (write-constructor (first s) fields e)
     (recur s e c d))
-  
+
   ;; TODO: deftype* needs to support static fields and static init
   [(?gen . ?s) ?e ((deftype* . ?body) . ?cs) ?d]
   (let [[tag-name class-name fields _ interfaces & bodies] body
@@ -146,7 +161,7 @@
         bodies (for [body bodies]
                  (cons 'proc body))
         fields-ins (for [f fields]
-                 (list 'make-field f))
+                     (list 'make-field f))
         e (assoc (->> (for [[n [kind idx]] e]
                         [n [:closed-over -1]])
                       (into {}))
@@ -168,19 +183,22 @@
   (do (println 'stack s)
       (let [gen (first s)
             s (rest s)]
-        (do
-          (prn 'something)
-          (prn 'stack s)
-          (prn 'gen gen)
-          (condp isa? (type c)
-            clojure.lang.Symbol (if (contains? e c)
+        (println c)
+        (condp #(isa? %2 %1) (type c)
+          clojure.lang.Symbol (if (contains? e c)
+                                (do
+                                  (local gen c e)
+                                  (recur (cons gen s) e cs d))
+                                (if-let [r (resolve c)]
                                   (do
-                                    (local gen c e)
+                                    (var-reference gen c e)
                                     (recur (cons gen s) e cs d))
-                                  (do
-                                    (println 'control c cs)
-                                    (println 'stack s gen)
-                                    (throw (Exception. "var resultion"))))
+                                  (throw (Exception. "missing resolution"))))
+          java.lang.Number (do
+                             (literal gen c)
+                             (recur (cons gen s) e cs d))
+          (do
+            (prn "unknown constant")
             (throw (Exception. "blarg"))))))
 
   [(?gen . nil) ?_ () ((?c ?s ?cn ?e) . ?d)]
@@ -191,7 +209,7 @@
     (finish gen cn)
     (prn 'post-finish)
     (recur s e c d))
-  
+
   [?s ?e ?c ?d]
   (prn 'fallback s e c d)
-)
+  )

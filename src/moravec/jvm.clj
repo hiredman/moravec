@@ -111,7 +111,13 @@
                (.getField (Type/getObjectType (.replace (name (second (:this-class env))) "." "/"))
                           (name local-name)
                           (Type/getType Object)))
-             :else (throw (Exception. "load arg")))))))))
+             :else (throw (Exception. "load arg")))))
+        (literal [cw value]
+          (doto gen
+            (.push (long value))
+            (.invokeStatic (Type/getType Long)
+                           (Method/getMethod "Long valueOf(long)")))
+          cw)))))
 
 ;; This is kind of a hack for eval
 (defn x []
