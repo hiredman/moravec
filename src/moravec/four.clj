@@ -29,6 +29,90 @@
           `(fn* ~@(:bodies result)))
         (meta form)))))
 
+;; DECISION: skip constant pooling for now, significant complexity,
+;; and I just want to get this thing off the ground
+
+;; ANF is a bridge too far, but should think about CPS
+
+;; (try
+;;   (println "hello")
+;;   (foo bar)
+;;   (catch RuntimeException e
+;;     (a b))
+;;   (catch Exception e
+;;     (baz bar)))
+
+;; (try
+;;   (try
+;;     (do
+;;       (println "hello")
+;;       (foo bar))
+;;     (catch RuntimeException e
+;;       (a b)))
+;;   (catch Exception e
+;;     (baz bar)))
+
+;; psuedo lambdas for forms
+
+;; ((try [K H bar]
+;;       ((try [K H bar]
+;;             ((do [K H _]
+;;                  (K (foo bar)))
+;;              K
+;;              H
+;;              (println "hello")))
+;;        K
+;;        (catch [K H ^RuntimeException e]
+;;            (K (a b)))
+;;        bar))
+;;  C.EXPRESSION
+;;  (catch [K H ^Exception H e]
+;;      (K (baz bar)))
+;;  bar)
+
+;; (let [a 1]
+;;   a)
+
+;; ((let [K H a]
+;;    a)
+;;  K
+;;  H
+;;  1)
+
+;; (try
+;;   (foo)
+;;   (finally
+;;    (bar)))
+
+;; (let [x (try
+;;           (foo)
+;;           (catch Throwable t
+;;             (do
+;;               (bar)
+;;               (throw t))))]
+;;   (do
+;;     (bar)
+;;     x))
+
+;; ((let [K H x]
+;;    ((do [K H _]
+;;         x)
+;;     (bar)))
+;;  K
+;;  H
+;;  ((try [K H _]
+;;        (K (foo)))
+;;   K
+;;   (catch [K H ^Throwable t]
+;;       ((do [K H _]
+;;            (throw t))
+;;         (bar)))
+;;   nil))
+
+;; maybe fns become deftypes in one pass, everything else becomes lambda in
+;; the next?
+
+;; TODO: what to do with var caches
 ;; TODO: deal with primitive args somehow?
 ;; TODO: handle apply, handle var args, handle everything.
 ;; TODO: needs to generate a replacement for AFn
