@@ -148,7 +148,8 @@
   (field [cw name])
   (constructor [cw name])
   (write-constructor [cw fields env])
-  (literal [cg value]))
+  (literal [cg value])
+  (var-reference [cg c e]))
 
 (defprotocol ConstructorBuilder
   (arguments [cw])
@@ -181,6 +182,7 @@
   [?s ?e ((proc ?name ?args . ?body) . ?c) ?d]
   (do
     (prn 'new-proc)
+    (prn body)
     (recur (list (new-procedure (first s) name (rest args)))
            (into e (map vector args
                         (map (partial vector :arg) (map dec (range)))))
@@ -228,30 +230,34 @@
 
   [(?sx ?cx . nil) ?ex ((m/end-constructor ?argc) . nil) ((?s ?e ?c) . ?d)]
   (do
+    (println "end-constructor")
     (end-ctor-call cx argc)
     (recur s e c d))
 
   [?s ?e ((m/create-constructor ?fields) . ?c) ?d]
   (do
+    (println "create-constructor")
     (write-constructor (first s) fields e)
     (recur s e c d))
 
   ;; TODO: deftype* needs to support static fields and static init
   [(?gen . ?s) ?e ((deftype* . ?body) . ?cs) ?d]
-  (let [[tag-name class-name fields _ interfaces & bodies] body
-        npg (new-procedure-group gen class-name interfaces)
-        dump (cons [cs (cons gen s) class-name e] d)
-        stack (list npg)
-        bodies (for [body bodies]
-                 (cons 'proc body))
-        fields-ins (for [f fields]
-                     (list 'make-field f))
-        e (assoc (->> (for [[n [kind idx]] e]
-                        [n [:closed-over -1]])
-                      (into {}))
-            :this-class ['_ class-name])]
-    (recur stack e
-           (concat fields-ins [`(m/create-constructor ~fields)] bodies) dump))
+  (do
+    (println "deftype")
+    (let [[tag-name class-name fields _ interfaces & bodies] body
+          npg (new-procedure-group gen class-name interfaces)
+          dump (cons [cs (cons gen s) class-name e] d)
+          stack (list npg)
+          bodies (for [body bodies]
+                   (cons 'proc body))
+          fields-ins (for [f fields]
+                       (list 'make-field f))
+          e (assoc (->> (for [[n [kind idx]] e]
+                          [n [:closed-over -1]])
+                        (into {}))
+              :this-class ['_ class-name])]
+      (recur stack e
+             (concat fields-ins [`(m/create-constructor ~fields)] bodies) dump)))
 
 
   ;; (do ...)
@@ -262,7 +268,32 @@
 
   [(?x . nil) ?_ () ()]
   x
+
+  [(?s . ?ss) ?e ((moravec.four/eval-op ?op) . ?c) ?d]
+  (do
+    (println "compiler function call")
+    (let [dump (conj d [:eval-op (conj ss s) e c])
+          stack (list s)
+          control (list `(cast clojure.lang.IFn ~op))]
+      (recur stack e control dump)))
+  [?s ?e () ((:eval-op ?stack ?env ?control) . ?dump)]
+  (recur stack env control dump)
+
+  [?s ?e ((moravec.four/fn-call ?argc) . ?c) ?d]
+  (do
+    (function-call (first s) argc)
+    (recur s e c d))
+
+  [?s ?e ((cast ?class ?obj) . ?c) ?d]
   
+  
+  [?s ?e ((?op . ?args) . ?c) ?d]
+  (do
+    (prn "function call" op args)
+    (recur s e (concat [`(eval-op ~op)]
+                       args
+                       [`(fn-call ~(count args))] c) d))
+
   [?s ?e (?c . ?cs) ?d]
   (do (println 'stack s)
       (let [gen (first s)
@@ -275,6 +306,7 @@
                                   (recur (cons gen s) e cs d))
                                 (if-let [r (resolve c)]
                                   (do
+                                    (println gen)
                                     (var-reference gen c e)
                                     (recur (cons gen s) e cs d))
                                   (throw (Exception. "missing resolution"))))
@@ -296,4 +328,31 @@
 
   [?s ?e ?c ?d]
   (prn 'fallback s e c d)
+  )
+
+(comment
+
+  (def cache (java.util.concurrent.ConcurrentHashMap.))
+
+  (.foo bar baz bleep)
+
+  (let [id 1
+        invoker (.get cache id)]
+    (if invoker
+      (invoker bar baz bleep)
+      (let [invoker (generate-invoke
+                     'foo (type-of bar) (type-of baz) (type-of bleep))]
+        (.put cache id invoker)
+        (invoker bar baz bleep))))
+
+  (fn [bar baz bleep]
+    (try
+      (let [bar (cast IA bar)
+            baz (cast IB baz)
+            bleep (cast IC bleep)]
+        (.foo bar baz bleep))
+      (catch ClassCastException e
+        (.put cache id (fn [bar baz bleep]
+                         (.foo bar baz bleep))))))
+
   )

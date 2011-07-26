@@ -81,6 +81,16 @@
           gen (GeneratorAdapter. Opcodes/ACC_PUBLIC m nil nil this-class-writer)]
       (reify
         CodeGenerator
+        (var-reference [cw c e]
+          (let [v (resolve c)]
+            (doto gen
+              (.push (name (ns-name (.ns v))))
+              (.push (name (.sym v)))
+              (.invokeStatic (Type/getType clojure.lang.RT)
+                             (Method/getMethod "clojure.lang.Var var(String, String)"))
+              (.invokeInterface (Type/getType clojure.lang.IDeref)
+                                (Method/getMethod
+                                 "Object deref()")))))
         (finish [cw n] (prn 'finish 1))
         (constructor [cw type-name]
           (.newInstance
@@ -93,7 +103,7 @@
               (.invokeConstructor
                gen (Type/getObjectType (.replace (name type-name) "." "/"))
                (Method. "<init>" Type/VOID_TYPE (into-array Type (repeat argc (Type/getType Object))))))))
-        (new-procedure-group [cg class-name interfaces]
+        (new-procedure-group [cg class-name interfaces]0
           (println 'new-proc)
           (class-writer class-name interfaces))
         (end-procedure [_]
